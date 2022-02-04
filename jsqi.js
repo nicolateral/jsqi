@@ -12,7 +12,7 @@ class InputStream {
     eof() {
         return this.peek() == '';
     }
-    croak(msg) {
+    throw(msg) {
         throw new Error(msg + ' (' + this.pos + ')');
     }
 }
@@ -24,7 +24,7 @@ class TokenStream {
         this.current = null;
         this.input = typeof input == 'string' ? new InputStream(input) : input;
     }
-    is_whitespace(ch) {
+    is_ch_whitespace(ch) {
         return ch == ' ';
     }
     is_ch_term(ch) {
@@ -98,7 +98,7 @@ class TokenStream {
         var ch;
 
         // Read whitespaces
-        this.read_while(this.is_whitespace);
+        this.read_while(this.is_ch_whitespace);
 
         // EOF
         if (this.input.eof()) {
@@ -142,7 +142,7 @@ class TokenStream {
 
 
         // Error
-        this.croak('Unexpected character: ' + ch);
+        this.throw('Unexpected character: ' + ch);
     }
     peek() {
         return this.current || (this.current = this.read_next());
@@ -155,8 +155,8 @@ class TokenStream {
     eof() {
         return this.peek() == null;
     }
-    croak(msg) {
-        return this.input.croak(msg);
+    throw(msg) {
+        return this.input.throw(msg);
     }
 }
 
@@ -173,7 +173,7 @@ class Parser {
     }
 
     unexpected() {
-        this.input.croak("Unexpected token: " + JSON.stringify(this.input.peek()));
+        this.input.throw("Unexpected token: " + JSON.stringify(this.input.peek()));
     }
     
     is_punc(ch) {
@@ -198,7 +198,7 @@ class Parser {
 
     skip_punc(ch) {
         if (this.is_punc(ch)) this.input.next();
-        else this.input.croak("Expecting punctuation: \"" + ch + "\"");
+        else this.input.throw("Expecting punctuation: \"" + ch + "\"");
     }
 
     delimited(start, stop, parser) {
@@ -207,18 +207,6 @@ class Parser {
         a = parser.call(this);
         this.skip_punc(stop);
         return a;
-    }
-
-    lazy_op(expr) {
-        expr = expr.call(this);
-        if (this.input.eof() || this.is_op() || this.is_punc(')')) {
-            return expr;
-        }
-        return new Op({
-            type: '|',
-            left: expr,
-            right: this.parse_bool_exp()
-        });
     }
 
     maybe_op(expr, prec) {
@@ -235,75 +223,99 @@ class Parser {
     }
 
     parse_bool_exps() {
-        return this.lazy_op(function() {
-            return this.delimited('(', ')', this.parse_bool_exp);
-        });
+        return this.delimited('(', ')', this.parse_bool_exp);
     }
 
     parse_op(left, prec) {
-        return new Op({
-            type: this.input.next().type,
-            left: left,
-            right: this.parse_bool_exp(prec)
-        });
+        return new Op(this.input.next().type, left, this.parse_bool_exp(prec));
     }
 
-    parse_not() {
-        return new Not({
-            type: this.input.next().type,
-            value: this.parse_bool_exp()
-        });
+    parse_not(prec) {
+        this.input.next();
+        return new Not(this.parse_bool_exp(prec));
     }
 
     parse_term() {
-        return this.lazy_op(function() {
-            return new Term(this.input.next());
-        });
+        return new Term(this.input.next().value);
     }
 
     parse_bool_exp(prec) {
+        prec = prec || 0;
         return this.maybe_op(function() {
             if (this.is_not('!')) {
-                return this.parse_not();
+                return this.parse_not(prec);
             }
             if (this.is_punc('(')) {
-                return this.lazy_op(this.parse_bool_exps);
+                return this.parse_bool_exps();
             }
             if (this.is_term()) {
-                return this.lazy_op(this.parse_term);
+                return this.parse_term();
             }
             this.unexpected();
-        }, prec || 0);
+        }, prec);
     }
 }
 
 class Term {
+
     constructor(value) {
         this.value = value;
     }
-    exec(str) {
-        return this.value.value == str;
+
+    exec(str, context) {
+        var gap = 0,
+            match = false,
+            value = this.value;
+
+        while (gap <= Math.ceil(this.value.length / 4) && !match) {
+            value = this.value.substring(0, this.value.length - gap++);
+            match = this.test(str, value, context);
+        }
+
+        return match;
+    }
+
+    test(str, value, context) {
+        var index = str.indexOf(value);
+        if (index == -1) {
+            return false;
+        }
+        context.term = context.term || {};
+        if (!context.term[index]) {
+            context.term[index] = {
+                length: value.length,
+                gap: this.value.length - value.length
+            };
+        }
+        return true;
     }
 }
 
 class Not {
+
     constructor(value) {
+        this.type = '!';
         this.value = value;
     }
-    exec(str) {
-        return !this.value.value.exec(str);
+
+    exec(str, context) {
+        return !this.value.exec(str, context);
     }
 }
 
 class Op {
-    constructor(value) {
-        this.value = value;
-    }
-    exec(str) {
-        var left = this.value.left.exec(str),
-            right = this.value.right.exec(str);
 
-        return this.value.type == '&' ? left && right : left || right;
+    constructor(type, left, right) {
+        this.type = type;
+        this.left = left;
+        this.right = right;
+    }
+
+    exec(str, context) {
+        var left = this.left.exec(str, context),
+            right = this.right.exec(str, context);
+
+        return this.type == '&' ? left && right : left || right;
     }
 }
 
@@ -313,10 +325,23 @@ class Interpreter {
         this.input = typeof input == 'string' ? new Parser(input) : input;
     }
 
-    exec(str) {
-        var parse = this.input.parse_bool_exp();
-        console.log(parse);
-        return parse.exec(str);
+    compile() {
+        var compile = this.value || (this.value = this.input.parse_bool_exp());
+        console.log(JSON.stringify(compile));
+        return compile;
+    }
+
+    exec(str, context) {
+        return this.compile().exec(str, context);
     }
 }
-console.log((new Interpreter('!abc')).exec('def'));
+try {
+    var context = {},
+        result = (new Interpreter('abc & !xxx | def')).exec('mystring abc def ghi jkl', context);
+
+    // Return
+    console.log(result, JSON.stringify(context));
+}
+catch (e) {
+    console.error(e);
+}
