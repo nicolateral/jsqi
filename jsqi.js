@@ -140,7 +140,6 @@ class TokenStream {
             };
         }
 
-
         // Error
         this.throw('Unexpected character: ' + ch);
     }
@@ -183,17 +182,17 @@ class Parser {
 
     is_op() {
         var tok = this.input.peek();
-        return tok && (tok.type == "&" || tok.type == '|');
+        return tok && (tok.type == "&" || tok.type == '|') && tok;
     }
 
     is_not() {
         var tok = this.input.peek();
-        return tok && tok.type == "!";
+        return tok && tok.type == "!" && tok;
     }
 
     is_term() {
         var tok = this.input.peek();
-        return tok && tok.type == "term" ;
+        return tok && tok.type == "term" && tok;
     }
 
     skip_punc(ch) {
@@ -201,65 +200,89 @@ class Parser {
         else this.input.throw("Expecting punctuation: \"" + ch + "\"");
     }
 
-    delimited(start, stop, parser) {
-        var a;
-        this.skip_punc(start);
-        a = parser.call(this);
-        this.skip_punc(stop);
-        return a;
+    parse_operands() {
+        var operands;
+        this.skip_punc('(');
+        operands = this.parse_operand(true);
+        this.skip_punc(')');
+        return operands;
     }
 
-    maybe_op(expr, prec) {
+    parse_operand(parse_op) {
+        if (parse_op !== false) {
+            return this.parse_operator(this.parse_operand(false), 0);
+        }
+        return this.lazy_operator(function() {
+            if (this.is_not('!')) {
+                return this.parse_not();
+            }
+            if (this.is_punc('(')) {
+                return this.parse_operands();
+            }
+            if (this.is_term()) {
+                return this.parse_term();
+            }
+            this.unexpected();
+        });
+    }
+    
+    lazy_operator(expr) {
         expr = expr.call(this);
-        if (this.is_op()) {
-            var next = this._precedence[this.input.peek().type];
+        if (this.input.eof() || this.is_op() || this.is_punc(')')) {
+            return expr;
+        }
+        if (this.is_lazy == false) {
+            this.throw_lazy();
+        } else {
+            this.is_lazy = true;
+        }
+        return new Op('|', expr, this.parse_operand(true));
+    }
+
+    parse_operator(left, prec) {
+        var tok,
+            tok = this.is_op();
+
+        if (tok) {
+            if (this.is_lazy == true) {
+                this.throw_lazy();
+            } else {
+                this.is_lazy = false;
+            }
+            var next = this._precedence[tok.type];
             if (next > prec) {
-                return this.maybe_op(function() {
-                    return this.parse_op(expr, next);
-                }, prec);
+                this.input.next();
+                return this.parse_operator(new Op(
+                    tok.type, 
+                    left, 
+                    this.parse_operator(this.parse_operand(false), next)
+                ), prec);
             }
         }
-        return expr;
+
+        return left;
     }
 
-    parse_bool_exps() {
-        return this.delimited('(', ')', this.parse_bool_exp);
-    }
-
-    parse_op(left, prec) {
-        return new Op(this.input.next().type, left, this.parse_bool_exp(prec));
-    }
-
-    parse_not(prec) {
+    parse_not() {
         this.input.next();
-        return new Not(this.parse_bool_exp(prec));
+        return new Not(this.parse_operand(false));
     }
 
     parse_term() {
         return new Term(this.input.next().value);
     }
 
-    parse_bool_exp(prec) {
-        prec = prec || 0;
-        return this.maybe_op(function() {
-            if (this.is_not('!')) {
-                return this.parse_not(prec);
-            }
-            if (this.is_punc('(')) {
-                return this.parse_bool_exps();
-            }
-            if (this.is_term()) {
-                return this.parse_term();
-            }
-            this.unexpected();
-        }, prec);
+    throw_lazy() {
+        return this.input.throw('Cannot mix lazy and non lazy operator');
     }
 }
 
 class Term {
 
     constructor(value) {
+        this.type = 'term';
         this.value = value;
+        this.tolerance = Math.ceil(value.length / 4);
     }
 
     exec(str, context) {
@@ -267,26 +290,23 @@ class Term {
             match = false,
             value = this.value;
 
-        while (gap <= Math.ceil(this.value.length / 4) && !match) {
+        while (gap <= this.tolerance && !match) {
             value = this.value.substring(0, this.value.length - gap++);
-            match = this.test(str, value, context);
+            match = this.match(str, value, context);
         }
 
         return match;
     }
 
-    test(str, value, context) {
+    match(str, value, context) {
         var index = str.indexOf(value);
         if (index == -1) {
             return false;
         }
-        context.term = context.term || {};
-        if (!context.term[index]) {
-            context.term[index] = {
-                length: value.length,
-                gap: this.value.length - value.length
-            };
-        }
+        context.get('term')[index] = {
+            length: value.length,
+            gap: this.value.length - value.length
+        };
         return true;
     }
 }
@@ -326,21 +346,36 @@ class Interpreter {
     }
 
     compile() {
-        var compile = this.value || (this.value = this.input.parse_bool_exp());
+        var compile = this.value || (this.value = this.input.parse_operand(true));
         console.log(JSON.stringify(compile));
         return compile;
     }
 
-    exec(str, context) {
-        return this.compile().exec(str, context);
+    exec(str) {
+        var context = new Context(),
+            success = this.compile().exec(str, context);
+
+        context.success = success;
+
+        return context;
     }
 }
+
+class Context {
+    get(key) {
+        if (!this[key]) {
+            this[key] = {};
+        }
+        return this[key];
+    }
+}
+
 try {
     var context = {},
-        result = (new Interpreter('abc & !xxx | def')).exec('mystring abc def ghi jkl', context);
+        result = (new Interpreter('!abc | "defg ghij"')).exec('mystring abc defg ghi jkl');
 
     // Return
-    console.log(result, JSON.stringify(context));
+    console.log(JSON.stringify(result));
 }
 catch (e) {
     console.error(e);
